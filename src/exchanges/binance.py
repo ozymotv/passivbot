@@ -8,7 +8,6 @@ import asyncio
 import traceback
 import numpy as np
 import json
-import passivbot_rust as pbr
 from copy import deepcopy
 from pure_funcs import (
     floatify,
@@ -27,13 +26,34 @@ assert_correct_ccxt_version(ccxt=ccxt_async)
 class BinanceBot(Passivbot):
     def __init__(self, config: dict):
         # Set request_timeout before calling super().__init__
-        self.request_timeout = 30000  # milliseconds
-        # Default retry settings
-        self.max_retries = 5
-        self.retry_delay = 2  # seconds
+        self.request_timeout = 60000  # increased from 30000 to 60000 milliseconds
+        # Enhanced retry settings
+        self.max_retries = 10  # increased from 5
+        self.retry_delay = 3  # increased from 2 seconds
         
         super().__init__(config)
         self.custom_id_max_length = 36
+        self.session_active = True  # Flag to track session status
+        
+        # Initialize context manager for resources
+        self._resources = []
+
+    async def __cleanup_resources(self):
+        """Close all active resources properly"""
+        for resource in self._resources:
+            try:
+                if hasattr(resource, 'close') and callable(resource.close):
+                    await resource.close()
+            except Exception as e:
+                logging.error(f"Error closing resource: {e}")
+        self._resources = []
+
+    async def shutdown(self):
+        """Properly shutdown the bot and cleanup resources"""
+        self.session_active = False
+        self.stop_websocket = True
+        await self.__cleanup_resources()
+        logging.info("BinanceBot resources cleaned up successfully")
 
     def create_ccxt_sessions(self):
         self.broker_code_spot = load_broker_code("binance_spot")
@@ -44,8 +64,8 @@ class BinanceBot(Passivbot):
                     "apiKey": self.user_info["key"],
                     "secret": self.user_info["secret"],
                     "password": self.user_info["passphrase"],
-                    "timeout": self.request_timeout,  # Set a longer timeout
-                    "enableRateLimit": True,  # Enable built-in rate limiting
+                    "timeout": self.request_timeout,
+                    "enableRateLimit": True,
                 }
             )
             session.options["defaultType"] = "swap"
@@ -60,9 +80,11 @@ class BinanceBot(Passivbot):
                     session.options["broker"][key] = "x-" + self.broker_code_spot
                     
             setattr(self, ccx, session)
+            # Add session to resources for cleanup
+            self._resources.append(session)
 
     async def _execute_with_retry(self, func, max_retries=None, retry_delay=None):
-        """Execute a function with retry logic for handling connection issues"""
+        """Execute a function with enhanced retry logic for handling connection issues"""
         if max_retries is None:
             max_retries = self.max_retries
         if retry_delay is None:
@@ -72,28 +94,36 @@ class BinanceBot(Passivbot):
         for attempt in range(max_retries):
             try:
                 return await func()
-            except ccxt_async.NetworkError as e:
+            except (ccxt_async.NetworkError, ccxt_async.RequestTimeout) as e:
                 last_error = e
                 if attempt < max_retries - 1:
-                    delay = retry_delay * (2 ** attempt)  # Exponential backoff
-                    logging.warning(f"Network error: {e}. Retrying in {delay}s... ({attempt+1}/{max_retries})")
-                    await asyncio.sleep(delay)
-            except ccxt_async.RequestTimeout as e:
-                last_error = e
-                if attempt < max_retries - 1:
-                    delay = retry_delay * (2 ** attempt)  # Exponential backoff
-                    logging.warning(f"Request timeout: {e}. Retrying in {delay}s... ({attempt+1}/{max_retries})")
+                    # Calculate delay with jitter to prevent thundering herd problem
+                    base_delay = retry_delay * (2 ** attempt)  # Exponential backoff
+                    jitter = base_delay * 0.2 * (np.random.random() * 2 - 1)  # ±20% jitter
+                    delay = max(0.5, base_delay + jitter)  # Ensure minimum delay
+                    
+                    error_type = "Network error" if isinstance(e, ccxt_async.NetworkError) else "Request timeout"
+                    logging.warning(f"{error_type}: {e}. Retrying in {delay:.2f}s... ({attempt+1}/{max_retries})")
                     await asyncio.sleep(delay)
             except ccxt_async.ExchangeError as e:
-                # For rate limit errors, we should wait longer
                 if "rate limit" in str(e).lower():
                     last_error = e
                     if attempt < max_retries - 1:
-                        delay = retry_delay * (2 ** attempt) * 2  # Longer delay for rate limits
+                        # Much longer delay for rate limits
+                        delay = retry_delay * (3 ** attempt)  # More aggressive backoff for rate limits
                         logging.warning(f"Rate limit exceeded: {e}. Retrying in {delay}s... ({attempt+1}/{max_retries})")
                         await asyncio.sleep(delay)
                 else:
-                    raise e  # Other exchange errors we should handle differently
+                    # For non-rate limit exchange errors, check if it's retriable
+                    if any(retriable_err in str(e).lower() for retriable_err in ["timeout", "connection", "network", "socket"]):
+                        last_error = e
+                        if attempt < max_retries - 1:
+                            delay = retry_delay * (2 ** attempt)
+                            logging.warning(f"Retriable exchange error: {e}. Retrying in {delay}s... ({attempt+1}/{max_retries})")
+                            await asyncio.sleep(delay)
+                    else:
+                        # Non-retriable exchange error
+                        raise e
         
         # If we've exhausted all retries, raise the last error
         if last_error:
@@ -159,32 +189,36 @@ class BinanceBot(Passivbot):
             self.c_mults[symbol] = elm["contractSize"]
 
     async def watch_balance(self):
-        while True:
+        while self.session_active and not self.stop_websocket:
             try:
-                if self.stop_websocket:
-                    break
                 res = await self.ccp.watch_balance()
                 self.handle_balance_update(res)
             except Exception as e:
                 print(f"exception watch_balance", e)
                 traceback.print_exc()
-                await asyncio.sleep(1)
+                if not self.session_active:
+                    break
+                await asyncio.sleep(3)  # Increased sleep time for stability
 
     async def watch_orders(self):
-        while True:
+        while self.session_active and not self.stop_websocket:
             try:
-                if self.stop_websocket:
-                    break
                 res = await self._execute_with_retry(lambda: self.ccp.watch_orders())
                 for i in range(len(res)):
-                    res[i]["position_side"] = res[i]["info"]["ps"].lower()
-                    res[i]["qty"] = res[i]["amount"]
+                    # Safely access position side with proper error handling
+                    if isinstance(res[i], dict) and 'info' in res[i] and isinstance(res[i]['info'], dict) and 'ps' in res[i]['info']:
+                        res[i]["position_side"] = res[i]["info"]["ps"].lower()
+                    else:
+                        res[i]["position_side"] = "none"  # Default value if missing
+                    res[i]["qty"] = res[i].get("amount", 0)
                 self.handle_order_update(res)
             except Exception as e:
                 if "Abnormal closure of client" not in str(e):
                     print(f"exception watch_orders", e)
                     traceback.print_exc()
-                await asyncio.sleep(1)
+                if not self.session_active:
+                    break
+                await asyncio.sleep(3)  # Increased sleep time for stability
 
     async def fetch_open_orders(self, symbol: str = None, all=False) -> [dict]:
         try:
@@ -220,9 +254,11 @@ class BinanceBot(Passivbot):
                 
             open_orders = {}
             for elm in fetched:
-                elm["position_side"] = elm["info"]["positionSide"].lower()
-                elm["qty"] = elm["amount"]
-                open_orders[elm["id"]] = elm
+                # Safely access data with proper error handling
+                if isinstance(elm, dict) and 'info' in elm and isinstance(elm['info'], dict):
+                    elm["position_side"] = elm["info"].get("positionSide", "").lower()
+                    elm["qty"] = elm.get("amount", 0)
+                    open_orders[elm["id"]] = elm
             return sorted(open_orders.values(), key=lambda x: x["timestamp"])
         except Exception as e:
             logging.error(f"error fetching open orders {e}")
@@ -246,17 +282,24 @@ class BinanceBot(Passivbot):
             
             positions = []
             for elm in fetched_positions:
-                if float(elm["positionAmt"]) != 0.0:
+                # Ensure we don't get type errors by checking data properly
+                pos_amt = float(elm.get("positionAmt", 0))
+                if pos_amt != 0.0:
                     positions.append(
                         {
                             "symbol": self.get_symbol_id_inv(elm["symbol"]),
-                            "position_side": elm["positionSide"].lower(),
-                            "size": float(elm["positionAmt"]),
-                            "price": float(elm["entryPrice"]),
+                            "position_side": elm.get("positionSide", "").lower(),
+                            "size": pos_amt,
+                            "price": float(elm.get("entryPrice", 0)),
                         }
                     )
             
-            balance = float(fetched_balance["info"]["totalCrossWalletBalance"])
+            # Safely access balance data
+            if isinstance(fetched_balance, dict) and "info" in fetched_balance:
+                balance = float(fetched_balance["info"].get("totalCrossWalletBalance", 0))
+            else:
+                balance = 0
+                
             if not hasattr(self, "previous_rounded_balance"):
                 self.previous_rounded_balance = balance
             self.previous_rounded_balance = hysteresis_rounding(
@@ -273,15 +316,15 @@ class BinanceBot(Passivbot):
             fetched = await self._execute_with_retry(
                 lambda: self.cca.fapipublic_get_ticker_bookticker()
             )
-            tickers = {
-                self.get_symbol_id_inv(elm["symbol"]): {
-                    "bid": float(elm["bidPrice"]),
-                    "ask": float(elm["askPrice"]),
-                }
-                for elm in fetched
-            }
-            for sym in tickers:
-                tickers[sym]["last"] = np.random.choice([tickers[sym]["bid"], tickers[sym]["ask"]])
+            tickers = {}
+            for elm in fetched:
+                if isinstance(elm, dict) and "symbol" in elm:
+                    symbol = self.get_symbol_id_inv(elm["symbol"])
+                    tickers[symbol] = {
+                        "bid": float(elm.get("bidPrice", 0)),
+                        "ask": float(elm.get("askPrice", 0)),
+                    }
+                    tickers[symbol]["last"] = np.random.choice([tickers[symbol]["bid"], tickers[symbol]["ask"]])
             return tickers
         except Exception as e:
             logging.error(f"error fetching tickers {e}")
@@ -311,9 +354,11 @@ class BinanceBot(Passivbot):
     ):
         try:
             pnls = await self.fetch_pnls_sub(start_time, end_time, limit)
-            symbols = sorted(set(self.positions) | set([x["symbol"] for x in pnls]))
+            symbols = sorted(set(getattr(self, 'positions', {}).keys()) | set([x.get("symbol", "") for x in pnls if isinstance(x, dict)]))
             tasks = {}
             for symbol in symbols:
+                if not symbol:  # Skip empty symbols
+                    continue
                 tasks[symbol] = asyncio.create_task(
                     self.fetch_fills_sub(symbol, start_time, end_time, limit)
                 )
@@ -325,18 +370,24 @@ class BinanceBot(Passivbot):
                     logging.error(f"Error fetching fills for {symbol}: {e}")
                     fills[symbol] = []
                     
-            fills = flatten(fills.values())
+            # Safely flatten fills - ensure they are all lists before flattening
+            valid_fills = [fills[symbol] for symbol in fills if isinstance(fills[symbol], list)]
+            flattened_fills = flatten(valid_fills)
+            
             if start_time:
-                pnls = [x for x in pnls if x["timestamp"] >= start_time]
-                fills = [x for x in fills if x["timestamp"] >= start_time]
-            unified = {x["id"]: x for x in pnls}
-            for x in fills:
-                if x["id"] in unified:
-                    unified[x["id"]].update(x)
-                else:
-                    unified[x["id"]] = x
+                pnls = [x for x in pnls if isinstance(x, dict) and x.get("timestamp", 0) >= start_time]
+                flattened_fills = [x for x in flattened_fills if isinstance(x, dict) and x.get("timestamp", 0) >= start_time]
+                
+            unified = {x["id"]: x for x in pnls if isinstance(x, dict) and "id" in x}
+            for x in flattened_fills:
+                if isinstance(x, dict) and "id" in x:
+                    if x["id"] in unified:
+                        unified[x["id"]].update(x)
+                    else:
+                        unified[x["id"]] = x
+                        
             result = []
-            for x in sorted(unified.values(), key=lambda x: x["timestamp"]):
+            for x in sorted(unified.values(), key=lambda x: x.get("timestamp", 0)):
                 if "position_side" not in x:
                     logging.info(f"debug: pnl without corresponding fill {x}")
                     x["position_side"] = "unknown"
@@ -368,10 +419,12 @@ class BinanceBot(Passivbot):
                 fetched = await self.fetch_pnl(start_time, end_time, limit)
                 if not fetched or fetched == []:
                     break
-                if fetched[0]["tradeId"] in all_fetched and fetched[-1]["tradeId"] in all_fetched:
-                    break
-                for elm in fetched:
-                    all_fetched[elm["tradeId"]] = elm
+                if len(fetched) > 0 and "tradeId" in fetched[0] and "tradeId" in fetched[-1]:
+                    if fetched[0]["tradeId"] in all_fetched and fetched[-1]["tradeId"] in all_fetched:
+                        break
+                    for elm in fetched:
+                        if "tradeId" in elm:
+                            all_fetched[elm["tradeId"]] = elm
                 if len(fetched) < limit:
                     break
                 logging.info(f"debug fetching pnls {ts_to_date_utc(fetched[-1]['timestamp'])}")
@@ -399,7 +452,7 @@ class BinanceBot(Passivbot):
                     end_time = self.get_exchange_time() + 1000 * 60 * 60
                 sts = start_time
                 retries = 0
-                max_retries = 3  # Max number of retries per chunk
+                max_retries = 5  # Increased max retries per chunk
                 
                 while True:
                     ets = min(end_time, sts + week * 0.999)
@@ -409,20 +462,32 @@ class BinanceBot(Passivbot):
                                 symbol, 
                                 limit=limit, 
                                 params={"startTime": int(sts), "endTime": int(ets)}
-                            )
+                            ),
+                            max_retries=max_retries
                         )
                         retries = 0  # Reset retry counter on success
                         
                         if fills:
-                            if fills[0]["id"] in all_fills and fills[-1]["id"] in all_fills:
+                            # Check for duplicate data safely
+                            has_first = any(fill.get("id") == fills[0].get("id") for fill in all_fills.values()) if fills[0].get("id") else False
+                            has_last = any(fill.get("id") == fills[-1].get("id") for fill in all_fills.values()) if fills[-1].get("id") else False
+                            
+                            if has_first and has_last and len(fills) > 1:
                                 break
+                                
                             for x in fills:
-                                all_fills[x["id"]] = x
-                            if fills[-1]["timestamp"] >= end_time:
+                                if "id" in x:
+                                    all_fills[x["id"]] = x
+                                    
+                            # Check if we've reached the end
+                            last_timestamp = fills[-1].get("timestamp", 0) if fills else 0
+                            if last_timestamp >= end_time:
                                 break
+                                
                             if end_time - sts < week and len(fills) < limit:
                                 break
-                            sts = fills[-1]["timestamp"]
+                                
+                            sts = last_timestamp
                             logging.info(
                                 f"fetched {len(fills)} fill{'s' if len(fills) > 1 else ''} for {symbol} {ts_to_date_utc(fills[0]['timestamp'])}"
                             )
@@ -435,17 +500,20 @@ class BinanceBot(Passivbot):
                         retries += 1
                         if retries >= max_retries:
                             logging.error(f"Failed to fetch trades for {symbol} after {max_retries} retries: {e}")
-                            sts = sts + week * 0.999  # Skip this time period after max retries
+                            sts = sts + week * 0.5  # Skip a smaller time period after max retries
                             retries = 0  # Reset for next chunk
                         else:
                             logging.warning(f"Error fetching trades for {symbol}, retry {retries}/{max_retries}: {e}")
-                            await asyncio.sleep(1 * (2 ** retries))  # Exponential backoff
+                            await asyncio.sleep(2 * (2 ** retries))  # Exponential backoff with higher base
                 
-                all_fills = sorted(all_fills.values(), key=lambda x: x["timestamp"])
+                # Convert dictionary to sorted list
+                all_fills = sorted(all_fills.values(), key=lambda x: x.get("timestamp", 0))
                 
+            # Process the fills safely
             for i in range(len(all_fills)):
-                all_fills[i]["pnl"] = float(all_fills[i]["info"]["realizedPnl"])
-                all_fills[i]["position_side"] = all_fills[i]["info"]["positionSide"].lower()
+                if isinstance(all_fills[i], dict) and "info" in all_fills[i]:
+                    all_fills[i]["pnl"] = float(all_fills[i]["info"].get("realizedPnl", 0))
+                    all_fills[i]["position_side"] = all_fills[i]["info"].get("positionSide", "").lower()
             return all_fills
         except Exception as e:
             logging.error(f"error with fetch_fills_sub {symbol} {e}")
@@ -469,15 +537,23 @@ class BinanceBot(Passivbot):
                 params["endTime"] = int(end_time)
                 
             fetched = await self._execute_with_retry(
-                lambda: self.cca.fapiprivate_get_income(params=params)
+                lambda: self.cca.fapiprivate_get_income(params=params),
+                max_retries=8  # Higher retries for this critical operation
             )
             
+            # Process the data safely
+            processed = []
             for i in range(len(fetched)):
-                fetched[i]["symbol"] = self.get_symbol_id_inv(fetched[i]["symbol"])
-                fetched[i]["pnl"] = float(fetched[i]["income"])
-                fetched[i]["timestamp"] = float(fetched[i]["time"])
-                fetched[i]["id"] = fetched[i]["tradeId"]
-            return sorted(fetched, key=lambda x: x["timestamp"])
+                if isinstance(fetched[i], dict):
+                    item = dict(fetched[i])  # Create a copy to avoid modifying the original
+                    if "symbol" in item:
+                        item["symbol"] = self.get_symbol_id_inv(item["symbol"])
+                    item["pnl"] = float(item.get("income", 0))
+                    item["timestamp"] = float(item.get("time", 0))
+                    item["id"] = item.get("tradeId", "")
+                    processed.append(item)
+                    
+            return sorted(processed, key=lambda x: x.get("timestamp", 0))
         except Exception as e:
             logging.error(f"error with fetch_pnl {e}")
             traceback.print_exc()
@@ -488,21 +564,25 @@ class BinanceBot(Passivbot):
             executed = await self._execute_with_retry(
                 lambda: self.cca.cancel_order(order["id"], symbol=order["symbol"])
             )
-            if "code" in executed and executed["code"] == -2011:
+            if isinstance(executed, dict) and "code" in executed and executed["code"] == -2011:
                 logging.info(f"{executed}")
                 return {}
-            return {
-                "symbol": executed["symbol"],
-                "side": executed["side"],
-                "id": executed["id"],
-                "position_side": executed["info"]["positionSide"].lower(),
-                "qty": executed["amount"],
-                "price": executed["price"],
-            }
+                
+            # Ensure we have all the required fields
+            if isinstance(executed, dict):
+                return {
+                    "symbol": executed.get("symbol", ""),
+                    "side": executed.get("side", ""),
+                    "id": executed.get("id", ""),
+                    "position_side": executed.get("info", {}).get("positionSide", "").lower() if "info" in executed else "",
+                    "qty": executed.get("amount", 0),
+                    "price": executed.get("price", 0),
+                }
+            return {}
         except Exception as e:
             if "-2011" in str(e):
                 # Order does not exist error - already cancelled or filled
-                logging.info(f"Order {order['id']} already cancelled or filled")
+                logging.info(f"Order {order.get('id', 'unknown')} already cancelled or filled")
                 return {}
             logging.error(f"error cancelling order {order} {e}")
             traceback.print_exc()
@@ -519,10 +599,10 @@ class BinanceBot(Passivbot):
 
     async def execute_order(self, order: dict) -> dict:
         try:
-            order_type = order["type"] if "type" in order else "limit"
+            order_type = order.get("type", "limit")
             params = {
-                "positionSide": order["position_side"].upper(),
-                "newClientOrderId": order["custom_id"],
+                "positionSide": order.get("position_side", "").upper(),
+                "newClientOrderId": order.get("custom_id", ""),
             }
             if order_type == "limit":
                 params["timeInForce"] = (
@@ -532,171 +612,85 @@ class BinanceBot(Passivbot):
             executed = await self._execute_with_retry(
                 lambda: self.cca.create_order(
                     type=order_type,
-                    symbol=order["symbol"],
-                    side=order["side"],
-                    amount=abs(order["qty"]),
-                    price=order["price"],
+                    symbol=order.get("symbol", ""),
+                    side=order.get("side", ""),
+                    amount=abs(order.get("qty", 0)),
+                    price=order.get("price", 0),
                     params=params,
-                )
+                ),
+                max_retries=8  # Higher retries for order execution
             )
             
-            if "info" in executed and "code" in executed["info"] and executed["info"]["code"] == "-5022":
-                logging.info(f"{executed['info']['msg']}")
-                return {}
-            elif "status" in executed and executed["status"] in ["open", "closed"]:
-                executed["position_side"] = executed["info"]["positionSide"].lower()
-                executed["qty"] = executed["amount"]
-                executed["reduce_only"] = executed["reduceOnly"]
-                return executed
+            if isinstance(executed, dict):
+                if "info" in executed and "code" in executed["info"] and executed["info"]["code"] == "-5022":
+                    logging.info(f"{executed['info'].get('msg', 'Order positioning error')}")
+                    return {}
+                elif "status" in executed and executed["status"] in ["open", "closed"]:
+                    executed["position_side"] = executed.get("info", {}).get("positionSide", "").lower() if "info" in executed else ""
+                    executed["qty"] = executed.get("amount", 0)
+                    executed["reduce_only"] = executed.get("reduceOnly", False)
+                    return executed
             return {}
         except Exception as e:
             logging.error(f"Error executing order: {e}")
             traceback.print_exc()
             return {}
 
-    async def execute_orders(self, orders: [dict]) -> [dict]:
-        if len(orders) == 0:
+    async def execute_orders(self, orders: list[dict]) -> list[dict]:
+        """
+        Execute one or more orders. If a single order is provided, delegate to execute_order.
+        Otherwise, send in batch respecting max creations per batch.
+        """
+        if not orders:
             return []
+
+        # Single order: delegate to existing method for retry, normalization, etc.
         if len(orders) == 1:
-            return [await self.execute_order(orders[0])]
-            
+            result = await self.execute_order(orders[0])
+            return [result]
+
+        # Prepare batch
         to_execute = []
-        for order in orders[: self.config["live"]["max_n_creations_per_batch"]]:
+        max_batch = self.config["live"]["max_n_creations_per_batch"]
+        for order in orders[:max_batch]:
             params = {
-                "positionSide": order["position_side"].upper(),
-                "newClientOrderId": order["custom_id"],
+                "positionSide": order.get("position_side", "").upper(),
+                "newClientOrderId": order.get("custom_id", ""),
             }
-            if order["type"] == "limit":
-                params["timeInForce"] = (
-                    "GTX" if self.config["live"]["time_in_force"] == "post_only" else "GTC"
-                )
-            to_execute.append(
-                {
-                    "type": "limit",
-                    "symbol": order["symbol"],
-                    "side": order["side"],
-                    "amount": abs(order["qty"]),
-                    "price": order["price"],
-                    "params": deepcopy(params),
-                }
-            )
-            
+            if order.get("type", "limit") == "limit":
+                tif = self.config["live"]["time_in_force"]
+                params["timeInForce"] = "GTX" if tif == "post_only" else "GTC"
+
+            to_execute.append({
+                "type": "limit",
+                "symbol": order.get("symbol", ""),
+                "side": order.get("side", ""),
+                "amount": abs(order.get("qty", 0)),
+                "price": order.get("price", 0),
+                "params": deepcopy(params),
+            })
+
+        # Send batch with retry
         try:
             executed = await self._execute_with_retry(
-                lambda: self.cca.create_orders(to_execute)
+                lambda: self.cca.create_orders(to_execute),
+                max_retries=8,
             )
-            
-            for i in range(len(executed)):
-                executed[i]["position_side"] = (
-                    executed[i]["info"]["positionSide"].lower()
-                    if "info" in executed[i] and "positionSide" in executed[i]["info"]
-                    else None
-                )
-                executed[i]["qty"] = executed[i]["amount"] if "amount" in executed[i] else 0.0
-                executed[i]["reduce_only"] = (
-                    executed[i]["reduceOnly"] if "reduceOnly" in executed[i] else None
-                )
 
-                if (
-                    "info" in executed[i]
-                    and "code" in executed[i]["info"]
-                    and executed[i]["info"]["code"] == "-5022"
-                ):
-                    logging.info(f"{executed[i]['info']['msg']}")
-                    executed[i] = {}
+            # Normalize and filter individual errors
+            for idx, item in enumerate(executed):
+                if isinstance(item, dict):
+                    info = item.get("info", {})
+                    item["position_side"] = info.get("positionSide", "").lower()
+                    item["qty"] = item.get("amount", 0)
+                    item["reduce_only"] = item.get("reduceOnly", False)
+                    # Handle client-side rejection code
+                    if info.get("code") == "-5022":
+                        logging.info(f"Order placement error: {info.get('msg', '')}")
+                        executed[idx] = {}
             return executed
+
         except Exception as e:
             logging.error(f"Error executing batch orders: {e}")
             traceback.print_exc()
             return [{}] * len(to_execute)
-
-    async def update_exchange_config_by_symbols(self, symbols):
-        for symbol in symbols:
-            # Execute each operation with retry logic
-            try:
-                await self._execute_with_retry(
-                    lambda: self.cca.set_margin_mode("cross", symbol=symbol)
-                )
-                logging.info(f"{symbol}: set cross mode")
-            except Exception as e:
-                logging.error(f"{symbol}: error setting cross mode {e}")
-                
-            try:
-                leverage = int(self.live_configs[symbol]["leverage"])
-                result = await self._execute_with_retry(
-                    lambda: self.cca.set_leverage(leverage, symbol=symbol)
-                )
-                logging.info(f"{symbol}: set leverage {leverage}")
-            except Exception as e:
-                logging.error(f"{symbol}: error setting leverage {e}")
-
-    async def update_exchange_config(self):
-        try:
-            res = await self._execute_with_retry(
-                lambda: self.cca.set_position_mode(True)
-            )
-            logging.info(f"set hedge mode {res}")
-        except Exception as e:
-            if '"code":-4059' in e.args[0]:
-                logging.info(f"hedge mode: {e}")
-            else:
-                logging.error(f"error setting hedge mode {e}")
-
-    async def determine_utc_offset(self, verbose=True):
-        # returns millis to add to utc to get exchange timestamp
-        # call some endpoint which includes timestamp for exchange's server
-        # if timestamp is not included in self.cca.fetch_balance(),
-        # implement method in exchange child class
-        try:
-            result = await self._execute_with_retry(
-                lambda: self.cca.fetch_ticker("BTC/USDT:USDT")
-            )
-            self.utc_offset = round((result["timestamp"] - utc_ms()) / (1000 * 60 * 60)) * (
-                1000 * 60 * 60
-            )
-            if verbose:
-                logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
-        except Exception as e:
-            logging.error(f"Error determining UTC offset: {e}")
-            self.utc_offset = 0
-
-    async def fetch_ohlcvs_1m(self, symbol: str, since: float = None, limit=None):
-        try:
-            n_candles_limit = 1500 if limit is None else limit
-            if since is None:
-                result = await self._execute_with_retry(
-                    lambda: self.cca.fetch_ohlcv(symbol, timeframe="1m", limit=n_candles_limit)
-                )
-                return result
-                
-            since = since // 60000 * 60000
-            max_n_fetches = 5000 // n_candles_limit
-            all_fetched = []
-            
-            for i in range(max_n_fetches):
-                fetched = await self._execute_with_retry(
-                    lambda: self.cca.fetch_ohlcv(
-                        symbol, timeframe="1m", since=int(since), limit=n_candles_limit
-                    )
-                )
-                all_fetched += fetched
-                if len(fetched) < n_candles_limit:
-                    break
-                since = fetched[-1][0]
-                
-            all_fetched_d = {x[0]: x for x in all_fetched}
-            return sorted(all_fetched_d.values(), key=lambda x: x[0])
-        except Exception as e:
-            logging.error(f"Error fetching OHLCV data: {e}")
-            traceback.print_exc()
-            return []
-
-    def format_custom_ids(self, orders: [dict]) -> [dict]:
-        # binance needs broker code at the beginning of the custom_id
-        new_orders = []
-        for order in orders:
-            order["custom_id"] = (
-                "x-" + self.broker_code + shorten_custom_id(order["custom_id"]) + uuid4().hex
-            )[: self.custom_id_max_length]
-            new_orders.append(order)
-        return new_orders
