@@ -1,17 +1,15 @@
-import time
-from collections import deque
-import traceback
-import asyncio
+from passivbot import Passivbot, logging
+from uuid import uuid4
+from njit_funcs import round_
 import ccxt.pro as ccxt_pro
 import ccxt.async_support as ccxt_async
-from uuid import uuid4
+import pprint
+import asyncio
+import traceback
 import numpy as np
 import json
-import pprint
-
-from passivbot import Passivbot, logging
-from njit_funcs import round_
 import passivbot_rust as pbr
+from copy import deepcopy
 from pure_funcs import (
     floatify,
     ts_to_date_utc,
@@ -20,105 +18,64 @@ from pure_funcs import (
     flatten,
     shorten_custom_id,
 )
-from procedures import (
-    print_async_exception,
-    utc_ms,
-    assert_correct_ccxt_version,
-    load_broker_code,
-)
+from procedures import print_async_exception, utc_ms, assert_correct_ccxt_version, load_broker_code
+import time
+from collections import deque
 
 assert_correct_ccxt_version(ccxt=ccxt_async)
+
+
+class AsyncRateLimiter:
+    def __init__(self, max_requests, window_ms):
+        self.max_requests = max_requests
+        self.window_ms = window_ms
+        self.timestamps = deque()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self.lock:
+            now = time.time() * 1000  # ms
+            while len(self.timestamps) >= self.max_requests:
+                if now - self.timestamps[0] > self.window_ms:
+                    self.timestamps.popleft()
+                else:
+                    await asyncio.sleep((self.window_ms - (now - self.timestamps[0])) / 1000)
+                    now = time.time() * 1000
+            self.timestamps.append(now)
 
 
 class BinanceBot(Passivbot):
     def __init__(self, config: dict):
         super().__init__(config)
         self.custom_id_max_length = 36
-
-        # ─── For sliding‐window rate limiting ───
-        # A deque to hold timestamps (in seconds) of the last Futures copy‐trading REST calls:
-        self._futures_call_timestamps = deque()
-
-    def _wait_for_copy_trading_slot(self):
-        """
-        Ensure we never send more than 20 Futures copy‐trading REST calls in any rolling 10-second window.
-        If we have already sent 20 calls in the last 10 s, sleep until we drop below that.
-        """
-        now = time.time()
-        window_start = now - 10.0  # 10 seconds ago
-
-        # Pop out any timestamps older than 10 seconds
-        while self._futures_call_timestamps and self._futures_call_timestamps[0] < window_start:
-            self._futures_call_timestamps.popleft()
-
-        # If already used up 20 calls in the past 10 seconds, wait until the oldest timestamp is >10 s ago
-        if len(self._futures_call_timestamps) >= 20:
-            oldest = self._futures_call_timestamps[0]
-            sleep_time = (oldest + 10.0) - now
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
-        # Now we have < 20 calls in the last 10s, so it’s OK to proceed.
-
-    async def _ccxt_request(self, method, *args, **kwargs):
-        """
-        Wrapper around any CCXT async method to enforce “20 calls / 10 s”:
-          1) Wait if needed (_wait_for_copy_trading_slot).
-          2) Call the actual CCXT method (e.g., create_order, fetch_ticker, etc.).
-          3) Record the timestamp of this call.
-        """
-        # 1) Possibly sleep so we don’t exceed 20 calls/10s
-        self._wait_for_copy_trading_slot()
-
-        # 2) Invoke the real CCXT method
-        result = await method(*args, **kwargs)
-
-        # 3) Record this call’s timestamp
-        self._futures_call_timestamps.append(time.time())
-
-        return result
+        # Add rate limiter: 20 requests per 10s (10,000 ms)
+        self.api_rate_limiter = AsyncRateLimiter(20, 10000)
 
     def create_ccxt_sessions(self):
-        # ─── FUTURES COPY TRADING ───
-        self.broker_code_fut = load_broker_code("binance_futures")
-
+        self.broker_code_spot = load_broker_code("binance_spot")
         for ccx, ccxt_module in [("cca", ccxt_async), ("ccp", ccxt_pro)]:
-            # 1) Instantiate the USDT-M FUTURES “binanceusdm” exchange
-            fut_cls = getattr(ccxt_module, "binanceusdm")
+            exchange_class = getattr(ccxt_module, "binanceusdm")
             setattr(
                 self,
                 ccx,
-                fut_cls({
-                    "apiKey":           self.user_info["key"],
-                    "secret":           self.user_info["secret"],
-                    "password":         self.user_info["passphrase"],
-                    "timeout":          60000,     # 60 s timeout
-                    "enableRateLimit":  False,     
-                    "aiohttp_proxy":    None,
-                    "asyncio_loop":     None,
-                })
+                exchange_class(
+                    {
+                        "apiKey": self.user_info["key"],
+                        "secret": self.user_info["secret"],
+                        "password": self.user_info["passphrase"],
+                        "options": {
+                            "recvWindow": 30000  # Acceptable time offset between client and server
+                        }
+                    }
+                ),
             )
-
-            exchange = getattr(self, ccx)
-            # 2) Force “swap” (perpetual‐futures) endpoints
-            exchange.options["defaultType"] = "swap"
-
-            # 3) Increase recvWindow to avoid timestamp‐offset errors
-            exchange.options["recvWindow"] = 50000
-            exchange.options["adjustForTimeDifference"] = True
-            exchange.options["retries"] = 3
-
-            # 4) Required headers (User-Agent + APIKEY)
-            exchange.headers = {
-                "User-Agent":   f"PassivBot/{self.version if hasattr(self, 'version') else '1.0'}",
-                "X-MBX-APIKEY": self.user_info["key"],
-            }
-
-            # 5) Attach all Futures subtypes with broker code
-            if self.broker_code_fut:
-                exchange.options.setdefault("broker", {})
-                for subtype in ["future", "delivery", "swap", "option"]:
-                    exchange.options["broker"][subtype] = "x-" + self.broker_code_fut
+            getattr(self, ccx).options["defaultType"] = "swap"
+            if self.broker_code:
+                for key in ["future", "delivery", "swap", "option"]:
+                    getattr(self, ccx).options["broker"][key] = "x-" + self.broker_code
+            if self.broker_code_spot:
+                for key in ["spot", "margin"]:
+                    getattr(self, ccx).options["broker"][key] = "x-" + self.broker_code_spot
 
     async def print_new_user_suggestion(self):
         between_print_wait_ms = 1000 * 60 * 60 * 4
@@ -129,19 +86,15 @@ class BinanceBot(Passivbot):
 
         res = None
         try:
-            # ───── wrap the CCXT call ─────
-            res = await self._ccxt_request(
-                self.cca.fapiprivate_get_apireferral_ifnewuser,
-                params={"brokerid": self.broker_code_fut},
+            res = await self.cca.fapiprivate_get_apireferral_ifnewuser(
+                params={"brokerid": self.broker_code}
             )
         except Exception as e:
             logging.error(f"failed to fetch fapiprivate_get_apireferral_ifnewuser {e}")
             print_async_exception(res)
             return
-
         if res["ifNewUser"] and res["rebateWorking"]:
             return
-
         lines = [
             "To support continued Passivbot development, please use a Binance account which",
             "1) was created after 2024-09-21 and",
@@ -185,8 +138,7 @@ class BinanceBot(Passivbot):
             try:
                 if self.stop_websocket:
                     break
-                # ───── wrap the CCXT watch_balance call ─────
-                res = await self._ccxt_request(self.ccp.watch_balance)
+                res = await self.ccp.watch_balance()
                 self.handle_balance_update(res)
             except Exception as e:
                 logging.error(f"exception watch_balance {e}")
@@ -198,8 +150,7 @@ class BinanceBot(Passivbot):
             try:
                 if self.stop_websocket:
                     break
-                # ───── wrap the CCXT watch_orders call ─────
-                res = await self._ccxt_request(self.ccp.watch_orders)
+                res = await self.ccp.watch_orders()
                 for i in range(len(res)):
                     res[i]["position_side"] = res[i]["info"]["ps"].lower()
                     res[i]["qty"] = res[i]["amount"]
@@ -210,15 +161,19 @@ class BinanceBot(Passivbot):
                     traceback.print_exc()
                 await asyncio.sleep(1)
 
+    async def _rate_limited(self, coro):
+        await self.api_rate_limiter.acquire()
+        return await coro
+
     async def fetch_open_orders(self, symbol: str = None, all=False) -> [dict]:
         fetched = None
         open_orders = {}
         try:
+            # binance has expensive fetch_open_orders without specified symbol
             if all:
                 self.cca.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
                 logging.info(f"fetching all open orders for binance")
-                # ───── wrap the CCXT fetch_open_orders call ─────
-                fetched = await self._ccxt_request(self.cca.fetch_open_orders)
+                fetched = await self._rate_limited(self.cca.fetch_open_orders())
                 self.cca.options["warnOnFetchOpenOrdersWithoutSymbol"] = True
             else:
                 symbols_ = set()
@@ -226,19 +181,14 @@ class BinanceBot(Passivbot):
                 symbols_.update([s for s in self.get_symbols_with_pos()])
                 if hasattr(self, "active_symbols") and self.active_symbols:
                     symbols_.update(list(self.active_symbols))
-                # Instead of launching all fetches simultaneously, we need to await them one by one
-                # so that our 20/10s wrapper can work properly.
-                fetched_lists = []
-                for symbol_ in sorted(symbols_):
-                    fetched_part = await self._ccxt_request(self.cca.fetch_open_orders, symbol_)
-                    fetched_lists.append(fetched_part)
-                fetched = [x for sublist in fetched_lists for x in sublist]
-
+                fetched = await asyncio.gather(
+                    *[self._rate_limited(self.cca.fetch_open_orders(symbol=symbol)) for symbol in sorted(symbols_)]
+                )
+                fetched = [x for sublist in fetched for x in sublist]
             for elm in fetched:
                 elm["position_side"] = elm["info"]["positionSide"].lower()
                 elm["qty"] = elm["amount"]
                 open_orders[elm["id"]] = elm
-
             return sorted(open_orders.values(), key=lambda x: x["timestamp"])
         except Exception as e:
             logging.error(f"error fetching open orders {e}")
@@ -247,12 +197,12 @@ class BinanceBot(Passivbot):
             return False
 
     async def fetch_positions(self) -> ([dict], float):
+        # also fetches balance
         fetched_positions, fetched_balance = None, None
         try:
-            # ───── wrap both CCXT calls in one gather ─────
             fetched_positions, fetched_balance = await asyncio.gather(
-                self._ccxt_request(self.cca.fapiprivatev3_get_positionrisk),
-                self._ccxt_request(self.cca.fetch_balance),
+                self._rate_limited(self.cca.fapiprivatev3_get_positionrisk()),
+                self._rate_limited(self.cca.fetch_balance())
             )
             positions = []
             for elm in fetched_positions:
@@ -285,8 +235,7 @@ class BinanceBot(Passivbot):
     async def fetch_tickers(self):
         fetched = None
         try:
-            # ───── wrap the CCXT fapipublic_get_ticker_bookticker call ─────
-            fetched = await self._ccxt_request(self.cca.fapipublic_get_ticker_bookticker)
+            fetched = await self._rate_limited(self.cca.fapipublic_get_ticker_bookticker())
             tickers = {
                 self.get_symbol_id_inv(elm["symbol"]): {
                     "bid": float(elm["bidPrice"]),
@@ -303,15 +252,15 @@ class BinanceBot(Passivbot):
             traceback.print_exc()
             if "bybit does not have market symbol" in str(e):
                 # ccxt is raising bad symbol error
-                # restart might help…
-                raise Exception("ccxt gives bad symbol error… attempting bot restart")
+                # restart might help...
+                raise Exception("ccxt gives bad symbol error... attempting bot restart")
             return False
 
     async def fetch_ohlcv(self, symbol: str, timeframe="1m"):
+        # intervals: 1,3,5,15,30,60,120,240,360,720,D,M,W
         fetched = None
         try:
-            # ───── wrap the CCXT fetch_ohlcv call ─────
-            fetched = await self._ccxt_request(self.cca.fetch_ohlcv, symbol, timeframe, 1000)
+            fetched = await self._rate_limited(self.cca.fetch_ohlcv(symbol, timeframe=timeframe, limit=1000))
             return fetched
         except Exception as e:
             logging.error(f"error fetching ohlcv for {symbol} {e}")
@@ -336,7 +285,6 @@ class BinanceBot(Passivbot):
         for symbol in tasks:
             fills[symbol] = await tasks[symbol]
         fills = flatten(fills.values())
-
         if start_time:
             pnls = [x for x in pnls if x["timestamp"] >= start_time]
             fills = [x for x in fills if x["timestamp"] >= start_time]
@@ -360,6 +308,12 @@ class BinanceBot(Passivbot):
         end_time: int = None,
         limit: int = None,
     ):
+        # binance needs symbol specified for fetch fills
+        # but can fetch pnls for all symbols
+        # fetch fills for all symbols with pos
+        # fetch pnls for all symbols
+        # fills only needed for symbols with pos for trailing orders
+        # binance returns at most 7 days worth of pnls per fetch unless both start_time and end_time are given
         if limit is None:
             limit = 1000
         else:
@@ -376,7 +330,7 @@ class BinanceBot(Passivbot):
             for elm in fetched:
                 all_fetched[elm["tradeId"]] = elm
             if start_time and end_time and len(fetched) < limit:
-                # means fetched all pnls in [start_time, end_time]
+                # means fetched all pnls inside [start_time, end_time] range
                 break
             logging.info(f"fetched pnls until {ts_to_date_utc(fetched[-1]['timestamp'])[:19]}")
             start_time = fetched[-1]["timestamp"]
@@ -386,45 +340,43 @@ class BinanceBot(Passivbot):
         try:
             if symbol not in self.markets_dict:
                 return []
+            # limit is max 1000
+            # fetches at most 7 days worth
             max_limit = 1000
             limit = min(max_limit, limit) if limit else max_limit
-            all_fills = {}
-
             if start_time is None and end_time is None:
-                # ───── wrap the CCXT fetch_my_trades call ─────
-                fills = await self._ccxt_request(self.cca.fetch_my_trades, symbol, limit)
-                for x in fills:
-                    all_fills[x["id"]] = x
+                fills = await self._rate_limited(self.cca.fetch_my_trades(symbol, limit=limit))
+                all_fills = {x["id"]: x for x in fills}
             elif start_time is None:
-                fills = await self._ccxt_request(
-                    self.cca.fetch_my_trades, symbol, limit, {"endTime": int(end_time)}
-                )
-                for x in fills:
-                    all_fills[x["id"]] = x
+                fills = await self._rate_limited(self.cca.fetch_my_trades(
+                    symbol, limit=limit, params={"endTime": int(end_time)}
+                ))
+                all_fills = {x["id"]: x for x in fills}
             else:
                 if end_time is None:
                     end_time = self.get_exchange_time() + 1000 * 60 * 60
+                all_fills = {}
                 params = {}
                 week = 1000 * 60 * 60 * 24 * 7.0
                 start_time_sub = start_time
                 while True:
-                    fills = await self._ccxt_request(
-                        self.cca.fetch_my_trades,
+                    fills = await self._rate_limited(self.cca.fetch_my_trades(
                         symbol,
-                        limit,
-                        {
-                            "startTime": int(min(start_time_sub, self.get_exchange_time() - 1000 * 60)),
-                            "endTime":   int(min(end_time, start_time_sub + week * 0.999)),
+                        limit=limit,
+                        params={
+                            "startTime": int(
+                                min(start_time_sub, self.get_exchange_time() - 1000 * 60)
+                            ),
+                            "endTime": int(min(end_time, start_time_sub + week * 0.999)),
                         },
-                    )
+                    ))
                     if not fills:
                         if end_time - start_time_sub < week * 0.9:
                             self.debug_print("debug fetch_fills_sub a", symbol)
                             break
                         else:
                             logging.info(
-                                f"fetched 0 fills for {symbol} between "
-                                f"{ts_to_date_utc(start_time_sub)[:19]} and {ts_to_date_utc(end_time)[:19]}"
+                                f"fetched 0 fills for {symbol} between {ts_to_date_utc(start_time_sub)[:19]} and {ts_to_date_utc(end_time)[:19]}"
                             )
                             start_time_sub += week
                             continue
@@ -434,8 +386,7 @@ class BinanceBot(Passivbot):
                             break
                         else:
                             logging.info(
-                                f"fetched 0 new fills for {symbol} between "
-                                f"{ts_to_date_utc(start_time_sub)[:19]} and {ts_to_date_utc(end_time)[:19]}"
+                                f"fetched 0 new fills for {symbol} between {ts_to_date_utc(start_time_sub)[:19]} and {ts_to_date_utc(end_time)[:19]}"
                             )
                             start_time_sub += week
                             continue
@@ -447,8 +398,7 @@ class BinanceBot(Passivbot):
                         break
                     start_time_sub = fills[-1]["timestamp"]
                     logging.info(
-                        f"fetched {len(fills)} fill{'s' if len(fills) > 1 else ''} for {symbol} "
-                        f"{ts_to_date_utc(fills[0]['timestamp'])[:19]}"
+                        f"fetched {len(fills)} fill{'s' if len(fills) > 1 else ''} for {symbol} {ts_to_date_utc(fills[0]['timestamp'])[:19]}"
                     )
             all_fills = sorted(all_fills.values(), key=lambda x: x["timestamp"])
             for i in range(len(all_fills)):
@@ -465,6 +415,10 @@ class BinanceBot(Passivbot):
         end_time: int = None,
         limit: int = None,
     ):
+        # will fetch from start_time until end_time, earliest first
+        # if start_time is None and end_time is None, will only fetch for last 7 days
+        # if end_time is None, will fetch for more than 7 days
+        # if start_time is None, will only fetch for last 7 days
         fetched = None
         max_limit = 1000
         if limit is None:
@@ -475,8 +429,7 @@ class BinanceBot(Passivbot):
                 params["startTime"] = int(start_time)
             if end_time is not None:
                 params["endTime"] = int(end_time)
-            # ───── wrap CCXT’s fapiprivate_get_income ─────
-            fetched = await self._ccxt_request(self.cca.fapiprivate_get_income, params=params)
+            fetched = await self._rate_limited(self.cca.fapiprivate_get_income(params=params))
             for i in range(len(fetched)):
                 fetched[i]["symbol"] = self.get_symbol_id_inv(fetched[i]["symbol"])
                 fetched[i]["pnl"] = float(fetched[i]["income"])
@@ -492,8 +445,7 @@ class BinanceBot(Passivbot):
     async def execute_cancellation(self, order: dict) -> dict:
         executed = None
         try:
-            # ───── wrap CCXT’s cancel_order ─────
-            executed = await self._ccxt_request(self.cca.cancel_order, order["id"], order["symbol"])
+            executed = await self._rate_limited(self.cca.cancel_order(order["id"], symbol=order["symbol"]))
             return executed
         except Exception as e:
             logging.error(f"error cancelling order {order} {e}")
@@ -514,23 +466,21 @@ class BinanceBot(Passivbot):
         try:
             order_type = order["type"] if "type" in order else "limit"
             params = {
-                "positionSide":    order["position_side"].upper(),
+                "positionSide": order["position_side"].upper(),
                 "newClientOrderId": order["custom_id"],
             }
             if order_type == "limit":
                 params["timeInForce"] = (
                     "GTX" if self.config["live"]["time_in_force"] == "post_only" else "GTC"
                 )
-            # ───── wrap CCXT’s create_order ─────
-            executed = await self._ccxt_request(
-                self.cca.create_order,
-                symbol=order["symbol"],
+            executed = await self._rate_limited(self.cca.create_order(
                 type=order_type,
+                symbol=order["symbol"],
                 side=order["side"],
                 amount=abs(order["qty"]),
                 price=order["price"],
                 params=params,
-            )
+            ))
             return executed
         except Exception as e:
             logging.error(f"error executing order {order} {e}")
@@ -543,29 +493,29 @@ class BinanceBot(Passivbot):
             return []
         if len(orders) == 1:
             return [await self.execute_order(orders[0])]
-
         to_execute = []
         for order in orders:
             params = {
-                "positionSide":    order["position_side"].upper(),
+                "positionSide": order["position_side"].upper(),
                 "newClientOrderId": order["custom_id"],
             }
             if order["type"] == "limit":
                 params["timeInForce"] = (
                     "GTX" if self.config["live"]["time_in_force"] == "post_only" else "GTC"
                 )
-            to_execute.append({
-                "type":   "limit",
-                "symbol": order["symbol"],
-                "side":   order["side"],
-                "amount": abs(order["qty"]),
-                "price":  order["price"],
-                "params": params.copy(),
-            })
-
+            to_execute.append(
+                {
+                    "type": "limit",
+                    "symbol": order["symbol"],
+                    "side": order["side"],
+                    "amount": abs(order["qty"]),
+                    "price": order["price"],
+                    "params": deepcopy(params),
+                }
+            )
+        executed = None
         try:
-            # ───── wrap CCXT’s create_orders ─────
-            executed = await self._ccxt_request(self.cca.create_orders, to_execute)
+            executed = await self._rate_limited(self.cca.create_orders(to_execute))
             return executed
         except Exception as e:
             logging.error(f"error executing orders {orders} {e}")
@@ -574,22 +524,20 @@ class BinanceBot(Passivbot):
             return []
 
     async def update_exchange_config_by_symbols(self, symbols):
-        coros_to_call_lev = {}
-        coros_to_call_margin_mode = {}
+        coros_to_call_lev, coros_to_call_margin_mode = {}, {}
         for symbol in symbols:
             try:
                 coros_to_call_margin_mode[symbol] = asyncio.create_task(
-                    self._ccxt_request(self.cca.set_margin_mode, "cross", symbol=symbol)
+                    self._rate_limited(self.cca.set_margin_mode("cross", symbol=symbol))
                 )
             except Exception as e:
                 logging.error(f"{symbol}: error setting cross mode {e}")
             try:
                 coros_to_call_lev[symbol] = asyncio.create_task(
-                    self._ccxt_request(self.cca.set_leverage, int(self.live_configs[symbol]["leverage"]), symbol=symbol)
+                    self._rate_limited(self.cca.set_leverage(int(self.live_configs[symbol]["leverage"]), symbol=symbol))
                 )
             except Exception as e:
                 logging.error(f"{symbol}: a error setting leverage {e}")
-
         for symbol in symbols:
             res = None
             to_print = ""
@@ -608,8 +556,7 @@ class BinanceBot(Passivbot):
 
     async def update_exchange_config(self):
         try:
-            # ───── wrap CCXT’s set_position_mode ─────
-            res = await self._ccxt_request(self.cca.set_position_mode, True)
+            res = await self._rate_limited(self.cca.set_position_mode(True))
             logging.info(f"set hedge mode {res}")
         except Exception as e:
             if '"code":-4059' in e.args[0]:
@@ -619,24 +566,28 @@ class BinanceBot(Passivbot):
 
     async def determine_utc_offset(self, verbose=True):
         # returns millis to add to utc to get exchange timestamp
-        # ───── wrap CCXT’s fetch_ticker ─────
-        result = await self._ccxt_request(self.cca.fetch_ticker, "BTC/USDT:USDT")
-        self.utc_offset = round((result["timestamp"] - utc_ms()) / (1000 * 60 * 60)) * (1000 * 60 * 60)
+        # call some endpoint which includes timestamp for exchange's server
+        # if timestamp is not included in self.cca.fetch_balance(),
+        # implement method in exchange child class
+        result = await self._rate_limited(self.cca.fetch_ticker("BTC/USDT:USDT"))
+        self.utc_offset = round((result["timestamp"] - utc_ms()) / (1000 * 60 * 60)) * (
+            1000 * 60 * 60
+        )
         if verbose:
             logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
 
     async def fetch_ohlcvs_1m(self, symbol: str, since: float = None, limit=None):
         n_candles_limit = 1500 if limit is None else limit
         if since is None:
-            # ───── wrap CCXT’s fetch_ohlcv ─────
-            result = await self._ccxt_request(self.cca.fetch_ohlcv, symbol, "1m", n_candles_limit)
+            result = await self._rate_limited(self.cca.fetch_ohlcv(symbol, timeframe="1m", limit=n_candles_limit))
             return result
-
         since = since // 60000 * 60000
         max_n_fetches = 5000 // n_candles_limit
         all_fetched = []
         for i in range(max_n_fetches):
-            fetched = await self._ccxt_request(self.cca.fetch_ohlcv, symbol, "1m", n_candles_limit, since=since, limit=n_candles_limit)
+            fetched = await self._rate_limited(self.cca.fetch_ohlcv(
+                symbol, timeframe="1m", since=int(since), limit=n_candles_limit
+            ))
             all_fetched += fetched
             if len(fetched) < n_candles_limit:
                 break
@@ -645,11 +596,11 @@ class BinanceBot(Passivbot):
         return sorted(all_fetched_d.values(), key=lambda x: x[0])
 
     def format_custom_ids(self, orders: [dict]) -> [dict]:
-        # Binance needs broker code (“x-<broker>”) at the start of custom_id
+        # binance needs broker code at the beginning of the custom_id
         new_orders = []
         for order in orders:
             order["custom_id"] = (
-                "x-" + self.broker_code_fut + shorten_custom_id(order["custom_id"]) + uuid4().hex
+                "x-" + self.broker_code + shorten_custom_id(order["custom_id"]) + uuid4().hex
             )[: self.custom_id_max_length]
             new_orders.append(order)
         return new_orders
