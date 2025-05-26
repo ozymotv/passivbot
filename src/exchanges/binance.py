@@ -29,12 +29,11 @@ class BinanceBot(Passivbot):
         self.custom_id_max_length = 36
 
     def create_ccxt_sessions(self):
-        # Only FUTURES Copy Trading (no spot)
-        # Load the broker code for Binance Futures Copy Trading
+        # ─── ONLY FUTURES COPY TRADING ───
         self.broker_code_fut = load_broker_code("binance_futures")
 
         for ccx, ccxt_module in [("cca", ccxt_async), ("ccp", ccxt_pro)]:
-            # Instantiate the USDT-M Futures exchange for copy trading
+            # 1) Instantiate the USDT-M FUTURES exchange for copy trading
             fut_cls = getattr(ccxt_module, "binanceusdm")
             setattr(
                 self,
@@ -43,34 +42,36 @@ class BinanceBot(Passivbot):
                     "apiKey":           self.user_info["key"],
                     "secret":           self.user_info["secret"],
                     "password":         self.user_info["passphrase"],
-                    "timeout":          60000,     # 60s timeout
+                    "timeout":          60000,     # 60 s timeout
                     "enableRateLimit":  True,
-                    "rateLimit":        50,        # typical futures throttle
+                    # 20 orders / 10 s ⇒ 1 request / 0.5 s ⇒ 500 ms
+                    "rateLimit":        500,
                     "aiohttp_proxy":    None,
                     "asyncio_loop":     None,
                 })
             )
 
             exchange = getattr(self, ccx)
-            # Force “swap” so CCXT hits USDT-M futures endpoints
+            # 2) Force “swap” so CCXT hits USDT-M perpetual‐futures endpoints
             exchange.options["defaultType"] = "swap"
 
-            # Make recvWindow large to prevent time-sync errors
-            exchange.options["recvWindow"] = 120000  # 120 seconds
+            # 3) Make recvWindow large to avoid time‐sync errors
+            exchange.options["recvWindow"] = 120000  # 120 s
             exchange.options["adjustForTimeDifference"] = True
             exchange.options["retries"] = 3
 
-            # Required headers
+            # 4) Set required headers (User-Agent + API key header)
             exchange.headers = {
                 "User-Agent":   f"PassivBot/{self.version if hasattr(self, 'version') else '1.0'}",
                 "X-MBX-APIKEY": self.user_info["key"],
             }
 
-            # Attach the futures broker code under all relevant subtypes
+            # 5) Attach the FUTURES broker code under all relevant subtypes
             if self.broker_code_fut:
                 exchange.options.setdefault("broker", {})
                 for subtype in ["future", "delivery", "swap", "option"]:
                     exchange.options["broker"][subtype] = "x-" + self.broker_code_fut
+
 
 
     async def print_new_user_suggestion(self):
