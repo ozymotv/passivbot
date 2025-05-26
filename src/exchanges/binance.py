@@ -29,27 +29,49 @@ class BinanceBot(Passivbot):
         self.custom_id_max_length = 36
 
     def create_ccxt_sessions(self):
-        self.broker_code_spot = load_broker_code("binance_spot")
+        # Only FUTURES Copy Trading (no spot)
+        # Load the broker code for Binance Futures Copy Trading
+        self.broker_code_fut = load_broker_code("binance_futures")
+
         for ccx, ccxt_module in [("cca", ccxt_async), ("ccp", ccxt_pro)]:
-            exchange_class = getattr(ccxt_module, "binanceusdm")
+            # Instantiate the USDT-M Futures exchange for copy trading
+            fut_cls = getattr(ccxt_module, "binanceusdm")
             setattr(
                 self,
                 ccx,
-                exchange_class(
-                    {
-                        "apiKey": self.user_info["key"],
-                        "secret": self.user_info["secret"],
-                        "password": self.user_info["passphrase"],
-                    }
-                ),
+                fut_cls({
+                    "apiKey":           self.user_info["key"],
+                    "secret":           self.user_info["secret"],
+                    "password":         self.user_info["passphrase"],
+                    "timeout":          60000,     # 60s timeout
+                    "enableRateLimit":  True,
+                    "rateLimit":        50,        # typical futures throttle
+                    "aiohttp_proxy":    None,
+                    "asyncio_loop":     None,
+                })
             )
-            getattr(self, ccx).options["defaultType"] = "swap"
-            if self.broker_code:
-                for key in ["future", "delivery", "swap", "option"]:
-                    getattr(self, ccx).options["broker"][key] = "x-" + self.broker_code
-            if self.broker_code_spot:
-                for key in ["spot", "margin"]:
-                    getattr(self, ccx).options["broker"][key] = "x-" + self.broker_code_spot
+
+            exchange = getattr(self, ccx)
+            # Force “swap” so CCXT hits USDT-M futures endpoints
+            exchange.options["defaultType"] = "swap"
+
+            # Make recvWindow large to prevent time-sync errors
+            exchange.options["recvWindow"] = 120000  # 120 seconds
+            exchange.options["adjustForTimeDifference"] = True
+            exchange.options["retries"] = 3
+
+            # Required headers
+            exchange.headers = {
+                "User-Agent":   f"PassivBot/{self.version if hasattr(self, 'version') else '1.0'}",
+                "X-MBX-APIKEY": self.user_info["key"],
+            }
+
+            # Attach the futures broker code under all relevant subtypes
+            if self.broker_code_fut:
+                exchange.options.setdefault("broker", {})
+                for subtype in ["future", "delivery", "swap", "option"]:
+                    exchange.options["broker"][subtype] = "x-" + self.broker_code_fut
+
 
     async def print_new_user_suggestion(self):
         between_print_wait_ms = 1000 * 60 * 60 * 4
