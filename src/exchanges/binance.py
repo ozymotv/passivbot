@@ -64,7 +64,7 @@ class BinanceBot(Passivbot):
                         "secret": self.user_info["secret"],
                         "password": self.user_info["passphrase"],
                         "options": {
-                            "recvWindow": 30000  # Acceptable time offset between client and server
+                            "recvWindow": 50000  # Acceptable time offset between client and server
                         }
                     }
                 ),
