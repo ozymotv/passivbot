@@ -56,7 +56,7 @@ class BinanceBot(Passivbot):
             exchange.options["defaultType"] = "swap"
 
             # 3) Make recvWindow large to avoid time‐sync errors
-            exchange.options["recvWindow"] = 120000  # 120 s
+            exchange.options["recvWindow"] = 59000  # 59 s
             exchange.options["adjustForTimeDifference"] = True
             exchange.options["retries"] = 3
 
