@@ -1,5 +1,8 @@
 import os
-
+from tools.event_loop_policy import set_windows_event_loop_policy
+# on Windows this will pick the SelectorEventLoopPolicy
+set_windows_event_loop_policy()
+import asyncio
 if "NOJIT" not in os.environ:
     os.environ["NOJIT"] = "true"
 
