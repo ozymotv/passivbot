@@ -174,6 +174,7 @@ def get_cache_hash(config, exchange):
         "exchange": config["backtest"]["exchanges"] if exchange == "combined" else exchange,
         "minimum_coin_age_days": config["live"]["minimum_coin_age_days"],
         "gap_tolerance_ohlcvs_minutes": config["backtest"]["gap_tolerance_ohlcvs_minutes"],
+        "config_has_mimic_backtest_1m_delay": "mimic_backtest_1m_delay" in config["live"],
     }
     return calc_hash(to_hash)
 
@@ -333,7 +334,11 @@ def expand_analysis(analysis_usd, analysis_btc, fills, config):
     if not config["backtest"]["use_btc_collateral"]:
         return analysis_usd
     return {
-        **{f"btc_{k}": v for k, v in analysis_btc.items() if "position" not in k},
+        **{
+            f"btc_{k}": v
+            for k, v in analysis_btc.items()
+            if "position" not in k and "volume_pct_per_day" not in k
+        },
         **analysis_usd,
     }
 
